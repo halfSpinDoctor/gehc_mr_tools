@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# sarTracker.sh
+#
+# Samuel A. Hurley
+# University of Wisconsin - Madison
+# 19 March 2026
+#
+# 0.1 - Initial version
+
+# DICOM DICT
+SCRIPTDIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+export DCMDICTPATH="$SCRIPTDIR"/dicom.dic
+
+# Default flag values
+export_csv=false
+ignore_orig=false
+ignore_proc=false
+examNumber=""
+show_help=false
+
+# Parse command line arguments
+for arg in "$@"; do
+    case "$arg" in
+        --csv) export_csv=true ;;
+        --ignore-orig) ignore_orig=true ;;
+        --ignore-proc) ignore_proc=true ;;
+        -h|--help) show_help=true ;;
+        -*) 
+            echo "Error: Unknown parameter passed: $arg"
+            exit 1 
+            ;;
+        *) 
+            # If it doesn't start with a dash, assume it's the exam number
+            examNumber="$arg" 
+            ;;
+    esac
+done
+
+# Display usage help screen if no exam number is provided or if help was requested
+if [ "$show_help" = true ] || [ -z "$examNumber" ]; then
+    echo "Usage: $(basename "$0") [OPTIONS] EXAM_NUMBER"
+    echo ""
+    echo "Arguments:"
+    echo "  EXAM_NUMBER       The numeric exam ID to process"
+    echo ""
+    echo "Options:"
+    echo "  --csv             Export results to a CSV file"
+    echo "  --ignore-orig     Ignore series starting with 'ORIG' or containing 'screen save'"
+    echo "  --ignore-proc     Ignore processed series (Series number >= 100)"
+    echo "  -h, --help        Display this help screen and exit"
+    echo ""
+    echo "Example:"
+    echo "  $(basename "$0") --csv --ignore-proc 12345"
+    exit 1
+fi
+
+# 1. Run the command to dump the files in the current working directory
+echo "Fetching files for exam $examNumber..."
+lx_ximg "E${examNumber}SallI1"
+
+# Initialize the CSV file with headers if the flag was used
+if [ "$export_csv" = true ]; then
+    csv_file="exam_${examNumber}_summary.csv"
+    echo "Series,Description,SAR,Time(us),Time(M:S),SAR*Mins" > "$csv_file"
+fi
+
+# Print the terminal table header
+printf "\n%-10s | %-30s | %-8s | %-13s | %-10s | %-15s\n" "Series" "Description" "SAR" "Time(us)" "Time(M:S)" "SAR*Mins"
+printf "%s\n" "--------------------------------------------------------------------------------------------------"
+
+# Initialize variables for totals
+total_time_sec=0
+total_sar_time=0
+
+# Pre-sort the files numerically by series number
+sorted_files=$(
+    for f in E"${examNumber}"S*I1.MR.dcm; do
+        [ -e "$f" ] || continue
+        s_tmp="${f#*E${examNumber}S}"
+        s="${s_tmp%%I1*}"
+        echo "$s:$f"
+    done | sort -t: -k1,1n | cut -d: -f2
+)
+
+# 2. Loop through the generated DICOM files
+for file in $sorted_files; do
+    
+    # Check if file exists
+    [ -e "$file" ] || continue
+
+    # Extract Series Number directly from the filename
+    series_tmp="${file#*E${examNumber}S}"
+    series="${series_tmp%%I1*}"
+
+    # Check if we need to ignore processed series (Series >= 100)
+    if [ "$ignore_proc" = true ] && [ "$series" -ge 100 ] 2>/dev/null; then
+        continue
+    fi
+
+    # a. Series Description (Tag 0008,103e)
+    desc=$(dcmdump "$file" | grep -i "0008,103e" | sed -n 's/.*\[\(.*\)\].*/\1/p' | head -n 1)
+    [ -z "$desc" ] && desc="N/A"
+
+    # Check if we need to ignore series starting with "ORIG" or containing "screen save"
+    if [ "$ignore_orig" = true ]; then
+        desc_lower=$(echo "$desc" | tr '[:upper:]' '[:lower:]')
+        if [[ "$desc" == ORIG* ]] || [[ "$desc_lower" == *"screen save"* ]]; then
+            continue
+        fi
+    fi
+
+    # b. Image duration (Tag 0019,105a)
+    # Allows integers, decimals, and scientific notation (e.g., e+08)
+    duration_us=$(dcmdump "$file" | grep -i "0019,105a" | head -n 1 | awk -F'#' '{print $1}' | grep -o -iE '[0-9]*\.?[0-9]+(e[-+]?[0-9]+)?' | tail -n 1)
+    [ -z "$duration_us" ] && duration_us=0
+
+    # Convert microseconds to total seconds
+    dur_sec=$(awk -v us="$duration_us" 'BEGIN { printf "%.2f", us / 1000000 }')
+    
+    # Calculate minutes and remaining seconds for display
+    dur_mins=$(awk -v sec="$dur_sec" 'BEGIN { printf "%d", sec / 60 }')
+    dur_remainder_secs=$(awk -v sec="$dur_sec" -v min="$dur_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
+    time_str="${dur_mins}:${dur_remainder_secs}"
+
+    # c. SAR Values (Tag 0018,1316)
+    sar=$(dcmdump "$file" | grep -i "0018,1316" | head -n 1 | awk -F'#' '{print $1}' | grep -o -iE '[0-9]*\.?[0-9]+(e[-+]?[0-9]+)?' | tail -n 1)
+    [ -z "$sar" ] && sar=0
+
+    # Calculate SAR * duration product (using minutes for the multiplier)
+    sar_time_prod=$(awk -v sar="$sar" -v sec="$dur_sec" 'BEGIN { printf "%.4f", sar * (sec / 60) }')
+
+    # Add to totals
+    total_time_sec=$(awk -v total="$total_time_sec" -v sec="$dur_sec" 'BEGIN { printf "%.2f", total + sec }')
+    total_sar_time=$(awk -v total="$total_sar_time" -v prod="$sar_time_prod" 'BEGIN { printf "%.4f", total + prod }')
+
+    # 3. Display the row in the terminal
+    printf "%-10s | %-30s | %-8.4f | %-13s | %-10s | %-15.4f\n" "$series" "${desc:0:30}" "$sar" "$duration_us" "$time_str" "$sar_time_prod"
+
+    # Export the row to the CSV file if the flag was used
+    if [ "$export_csv" = true ]; then
+        echo "${series},\"${desc}\",${sar},${duration_us},${time_str},${sar_time_prod}" >> "$csv_file"
+    fi
+
+done
+
+# Print the bottom separator for the terminal
+printf "%s\n" "--------------------------------------------------------------------------------------------------"
+
+# Calculate total time in MM:SS
+total_mins=$(awk -v sec="$total_time_sec" 'BEGIN { printf "%d", sec / 60 }')
+total_remainder_secs=$(awk -v sec="$total_time_sec" -v min="$total_mins" 'BEGIN { printf "%02.0f", sec - (min * 60) }')
+total_time_str="${total_mins}:${total_remainder_secs}"
+
+# 4. Display the final tally in the terminal
+printf "%-10s   %-30s   %-8s | %-13s | %-10s | %-15.4f\n\n" "TOTALS" "" "" "" "$total_time_str" "$total_sar_time"
+
+# Append the final tally to the CSV file if the flag was used
+if [ "$export_csv" = true ]; then
+    echo "TOTALS,,,,${total_time_str},${total_sar_time}" >> "$csv_file"
+    echo "Done! Data successfully exported to: $csv_file"
+fi
+
+# 5. Clean up intermediate files
+echo "Cleaning up temporary DICOM files..."
+rm -f E"${examNumber}"S*I1.MR.dcm
+echo "Cleanup complete."
+
